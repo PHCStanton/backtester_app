@@ -16,14 +16,18 @@ class KBRetriever:
         Optimizations (e.g. SQLite database creation, index building, 
         hash map indexing, or Obsidian folder structure generation) should occur here.
         """
-        self.index = defaultdict(list)
+        tmp = defaultdict(list)
         for p in raw_patterns_list:
             a = self._normalize(p.get("asset", ""))
             r = p.get("regime_label", "").upper().strip()
             l = p.get("strategy_level", "").lower().strip()
             d = p.get("direction", "").upper().strip()
             key = (a, r, l, d)
-            self.index[key].append(p)
+            tmp[key].append(p)
+        self.index = {}
+        for key, lst in tmp.items():
+            lst.sort(key=lambda x: x.get("expectancy", 0.0), reverse=True)
+            self.index[key] = lst
 
     def query(
         self,
@@ -43,6 +47,4 @@ class KBRetriever:
         d = direction.upper().strip()
         key = (clean_asset, r, l, d)
         matches = self.index.get(key, [])
-        # Sort by expectancy descending for consistency with baseline top results
-        matches.sort(key=lambda x: x.get("expectancy", 0.0), reverse=True)
         return matches[:5]
