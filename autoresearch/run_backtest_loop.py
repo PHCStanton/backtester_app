@@ -37,8 +37,9 @@ if not GROK_API_KEY:
     sys.exit(1)
 
 # Model configuration
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-2")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.3")
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
+
 
 # File targets
 TARGET_FILE = AUTORESEARCH_DIR / "strategy_candidate.py"
