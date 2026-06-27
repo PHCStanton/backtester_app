@@ -24,10 +24,7 @@ class KBRetriever:
             d = p.get("direction", "").upper().strip()
             key = (a, r, l, d)
             tmp[key].append(p)
-        self.index = {}
-        for key, lst in tmp.items():
-            lst.sort(key=lambda x: x.get("expectancy", 0.0), reverse=True)
-            self.index[key] = lst
+        self.index = dict(tmp)
 
     def query(
         self,
