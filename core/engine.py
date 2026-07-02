@@ -7,7 +7,7 @@ import sys
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence, Tuple, Dict
+from typing import Any, Sequence, Tuple, Dict, Protocol
 import numpy as np
 
 # Adjust sys.path to REPO_ROOT
@@ -80,6 +80,11 @@ class BayesianConfig:
     max_fraction: float = 0.10
 
 @dataclass
+class ManipulationConfig:
+    veto_enabled: bool = False
+    min_severity_level: str = "HIGH"  # "HIGH", "MEDIUM", or "LOW"
+
+@dataclass
 class UnifiedBacktestConfig:
     payout_pct: float = 92.0
     kalman: KalmanConfig = field(default_factory=KalmanConfig)
@@ -90,6 +95,7 @@ class UnifiedBacktestConfig:
     pocket: PocketConfig = field(default_factory=PocketConfig)
     timeframe: TimeframeConfig = field(default_factory=TimeframeConfig)
     bayesian: BayesianConfig = field(default_factory=BayesianConfig)
+    manipulation: ManipulationConfig = field(default_factory=ManipulationConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UnifiedBacktestConfig:
@@ -101,6 +107,7 @@ class UnifiedBacktestConfig:
         pocket_data = data.get("pocket", {})
         timeframe_data = data.get("timeframe", {})
         bayesian_data = data.get("bayesian", {})
+        manipulation_data = data.get("manipulation", {})
 
         return cls(
             payout_pct=float(data.get("payout_pct", 92.0)),
@@ -151,7 +158,68 @@ class UnifiedBacktestConfig:
                 risk_aversion=float(bayesian_data.get("risk_aversion", 2.0)),
                 max_fraction=float(bayesian_data.get("max_fraction", 0.10)),
             ),
+            manipulation=ManipulationConfig(
+                veto_enabled=bool(manipulation_data.get("veto_enabled", False)),
+                min_severity_level=str(manipulation_data.get("min_severity_level", "HIGH")),
+            ),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "payout_pct": self.payout_pct,
+            "kalman": {
+                "enabled": self.kalman.enabled,
+                "q": self.kalman.q,
+                "r": self.kalman.r,
+                "upstream_of_hurst": self.kalman.upstream_of_hurst,
+            },
+            "hurst": {
+                "veto_enabled": self.hurst.veto_enabled,
+                "window_size": self.hurst.window_size,
+                "mean_revert_limit": self.hurst.mean_revert_limit,
+                "trend_limit": self.hurst.trend_limit,
+            },
+            "ou": {
+                "veto_enabled": self.ou.veto_enabled,
+                "mode": self.ou.mode,
+                "window_size": self.ou.window_size,
+                "q_c": self.ou.q_c,
+                "q_beta": self.ou.q_beta,
+                "r": self.ou.r,
+            },
+            "expiry": {
+                "mode": self.expiry.mode,
+                "static_seconds": self.expiry.static_seconds,
+                "adaptive_c": self.expiry.adaptive_c,
+                "adaptive_bounds": self.expiry.adaptive_bounds,
+            },
+            "indicator": {
+                "level_mode": self.indicator.level_mode,
+                "cooldown_ticks": self.indicator.cooldown_ticks,
+            },
+            "pocket": {
+                "veto_enabled": self.pocket.veto_enabled,
+                "exclusion_list": self.pocket.exclusion_list,
+            },
+            "timeframe": {
+                "veto_enabled": self.timeframe.veto_enabled,
+                "exclusion_blocks": self.timeframe.exclusion_blocks,
+            },
+            "bayesian": {
+                "enabled": self.bayesian.enabled,
+                "alpha_prior": self.bayesian.alpha_prior,
+                "beta_prior": self.bayesian.beta_prior,
+                "confidence_threshold": self.bayesian.confidence_threshold,
+                "breakeven_win_rate": self.bayesian.breakeven_win_rate,
+                "risk_aversion": self.bayesian.risk_aversion,
+                "max_fraction": self.bayesian.max_fraction,
+            },
+            "manipulation": {
+                "veto_enabled": self.manipulation.veto_enabled,
+                "min_severity_level": self.manipulation.min_severity_level,
+            }
+        }
+
 
 # --- Base Estimator Helpers ---
 
@@ -245,10 +313,10 @@ class ParameterKalmanTracker:
         return 0.0, float(self.beta)
 
 class UnifiedHurstTracker:
-    def __init__(self, mean_revert_limit: float, trend_limit: float) -> None:
+    def __init__(self, window_size: int, mean_revert_limit: float, trend_limit: float) -> None:
         self.mean_revert_limit = mean_revert_limit
         self.trend_limit = trend_limit
-        self.prices = deque(maxlen=1000)
+        self.prices = deque(maxlen=window_size)
         self.regime = "random_walk"
         self.last_h = 0.5
 
@@ -453,6 +521,167 @@ def calculate_rolling_ou(prices: np.ndarray, timestamps: np.ndarray, window_size
     tau = math.log(2) / theta
     return float(tau)
 
+# --- Veto Gates and Pipeline ---
+
+class GateContext:
+    """All runtime state needed by any gate to make a veto decision."""
+    def __init__(
+        self,
+        timestamp: float,
+        price: float,
+        direction: str,
+        hurst_value: float,
+        hurst_regime: str,
+        ou_beta: float | None,
+        tau_ou: float | None,
+        pocket_state: str,
+        vol_level: str,
+        liq_level: str,
+        manip_level: str,
+        hour_offset: int,
+        four_hour_offset: int,
+        volatility_score: float,
+        payout_pct: float,
+        expiry_seconds: int = 0
+    ) -> None:
+        self.timestamp = timestamp
+        self.price = price
+        self.direction = direction
+        self.hurst_value = hurst_value
+        self.hurst_regime = hurst_regime
+        self.ou_beta = ou_beta
+        self.tau_ou = tau_ou
+        self.pocket_state = pocket_state
+        self.vol_level = vol_level
+        self.liq_level = liq_level
+        self.manip_level = manip_level
+        self.hour_offset = hour_offset
+        self.four_hour_offset = four_hour_offset
+        self.volatility_score = volatility_score
+        self.payout_pct = payout_pct
+        self.expiry_seconds = expiry_seconds
+
+class FilterGate(Protocol):
+    enabled: bool
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        ...
+
+class HurstFilterGate:
+    def __init__(self, config: HurstConfig) -> None:
+        self.config = config
+        self.enabled = config.veto_enabled
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        if context.hurst_regime == "trending":
+            return True, "hurst_veto_trend"
+        elif context.hurst_regime == "random_walk":
+            return True, "hurst_veto_chop"
+        return False, None
+
+class OUFilterGate:
+    def __init__(self, config: OUConfig) -> None:
+        self.config = config
+        self.enabled = config.veto_enabled
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        if self.config.mode == "kalman":
+            if context.ou_beta is not None and context.ou_beta >= 0:
+                return True, "ou_veto_explosive"
+        else:  # ols
+            if context.tau_ou is None:
+                return True, "ou_veto_non_reverting"
+        return False, None
+
+class PocketPreSignalGate:
+    def __init__(self, config: PocketConfig) -> None:
+        self.config = config
+        self.enabled = config.veto_enabled
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        if context.pocket_state in self.config.exclusion_list:
+            reason = f"pocket_veto_{context.pocket_state.replace(' ', '').replace('|', '_')}"
+            return True, reason
+        return False, None
+
+class TimeframeFilterGate:
+    def __init__(self, config: TimeframeConfig) -> None:
+        self.config = config
+        self.enabled = config.veto_enabled
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        if context.four_hour_offset in self.config.exclusion_blocks:
+            return True, f"timeframe_veto_block_{context.four_hour_offset}"
+        return False, None
+
+class ManipulationFilterGate:
+    def __init__(self, config: ManipulationConfig) -> None:
+        self.config = config
+        self.enabled = config.veto_enabled
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        severity_mapping = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+        current_val = severity_mapping.get(context.manip_level, 0)
+        limit_val = severity_mapping.get(self.config.min_severity_level, 3)
+        if current_val >= limit_val:
+            return True, f"manipulation_veto_{context.manip_level}"
+        return False, None
+
+class PocketPerCellGate:
+    def __init__(self, config: PocketConfig) -> None:
+        self.config = config
+        self.enabled = config.veto_enabled
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        cell_key = f"{context.pocket_state}|{context.expiry_seconds}"
+        if cell_key in self.config.exclusion_list:
+            return True, "pocket_expiry_veto"
+        return False, None
+
+class BayesianPerCellGate:
+    def __init__(self, config: BayesianConfig, engine: BayesianUtilityEngine) -> None:
+        self.config = config
+        self.engine = engine
+        self.enabled = config.enabled
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        
+        # 1. Credible Gate Check
+        credible_ok = self.engine.verify_credible_gate(
+            context.pocket_state,
+            context.expiry_seconds,
+            threshold=self.config.breakeven_win_rate,
+            confidence=self.config.confidence_threshold
+        )
+        if not credible_ok:
+            return True, "bayesian_veto_credible"
+        
+        # 2. Sizing Sizer Check
+        opt_fraction, _ = self.engine.calculate_optimal_sizing(
+            context.pocket_state,
+            context.expiry_seconds,
+            payout_pct=context.payout_pct,
+            risk_aversion=self.config.risk_aversion,
+            max_fraction=self.config.max_fraction
+        )
+        if opt_fraction <= 0.005:
+            return True, "bayesian_veto_utility"
+            
+        return False, None
+
 # --- Unified Backtester ---
 
 class UnifiedBacktester:
@@ -465,7 +694,11 @@ class UnifiedBacktester:
         
         # Pre-filters and parameters trackers
         self.kalman_filter = KalmanFilter(config.kalman.q, config.kalman.r)
-        self.hurst_tracker = UnifiedHurstTracker(config.hurst.window_size, config.hurst.trend_limit)
+        self.hurst_tracker = UnifiedHurstTracker(
+            window_size=config.hurst.window_size,
+            mean_revert_limit=config.hurst.mean_revert_limit,
+            trend_limit=config.hurst.trend_limit
+        )
         self.ou_kalman_tracker = ParameterKalmanTracker(config.ou.q_beta, config.ou.r)
         
         # Bayesian Utility Engine
@@ -473,6 +706,21 @@ class UnifiedBacktester:
             alpha_prior=config.bayesian.alpha_prior,
             beta_prior=config.bayesian.beta_prior
         )
+        
+        # Veto gate pipelines
+        self.pre_signal_gates = [
+            HurstFilterGate(config.hurst),
+            OUFilterGate(config.ou),
+            PocketPreSignalGate(config.pocket),
+            TimeframeFilterGate(config.timeframe),
+            ManipulationFilterGate(config.manipulation),
+        ]
+        
+        self.per_cell_gates = [
+            PocketPerCellGate(config.pocket),
+            BayesianPerCellGate(config.bayesian, self.bayesian_engine),
+        ]
+        
         # Pending trades list for walk-forward updates: list[dict]
         self.pending_trades: list[dict[str, Any]] = []
         
@@ -484,7 +732,22 @@ class UnifiedBacktester:
         # Stats tracking
         self.veto_counts = defaultdict(int)
 
+    def reset_trackers(self) -> None:
+        self.kalman_filter = KalmanFilter(self.config.kalman.q, self.config.kalman.r)
+        self.hurst_tracker = UnifiedHurstTracker(
+            window_size=self.config.hurst.window_size,
+            mean_revert_limit=self.config.hurst.mean_revert_limit,
+            trend_limit=self.config.hurst.trend_limit
+        )
+        self.ou_kalman_tracker = ParameterKalmanTracker(self.config.ou.q_beta, self.config.ou.r)
+        self.pending_trades.clear()
+        self._price_buffer.clear()
+        self._ou_last_price = None
+        self._ou_dt_buffer.clear()
+        self.veto_counts.clear()
+
     def run_file(self, path: Path) -> list[dict[str, Any]]:
+        self.reset_trackers()
         ticks = load_ticks_from_file(path)
         if not ticks:
             return []
@@ -582,6 +845,26 @@ class UnifiedBacktester:
             vol_lvl, liq_lvl, manip_lvl, pocket_state = self.pocket_tracker.update(tick.timestamp, raw_price)
             hour_offset, four_hour_offset = calculate_time_offsets(tick.timestamp)
 
+            # Create GateContext (with direction/expiry to be filled)
+            gate_context = GateContext(
+                timestamp=tick.timestamp,
+                price=tick.price,
+                direction="",
+                hurst_value=h_val,
+                hurst_regime=h_regime,
+                ou_beta=ou_beta,
+                tau_ou=tau_ou,
+                pocket_state=pocket_state,
+                vol_level=vol_lvl,
+                liq_level=liq_lvl,
+                manip_level=manip_lvl,
+                hour_offset=hour_offset,
+                four_hour_offset=four_hour_offset,
+                volatility_score=v_score,
+                payout_pct=self.config.payout_pct,
+                expiry_seconds=0
+            )
+
             # 3. Evaluate Policies and Signals
             if isinstance(oteo_res, dict):
                 level1 = dict(oteo_res)
@@ -609,41 +892,18 @@ class UnifiedBacktester:
                     if direction not in {"CALL", "PUT"}:
                         continue
 
-                    # 4. Evaluate Veto Gates
+                    # Update context direction
+                    gate_context.direction = direction
+
+                    # 4. Evaluate Pre-Signal Veto Gates
                     vetoed = False
                     veto_reason = None
-
-                    # Hurst veto gate
-                    if self.config.hurst.veto_enabled:
-                        if h_regime == "trending":
+                    for gate in self.pre_signal_gates:
+                        gate_vetoed, gate_reason = gate.evaluate(gate_context)
+                        if gate_vetoed:
                             vetoed = True
-                            veto_reason = "hurst_veto_trend"
-                        elif h_regime == "random_walk":
-                            vetoed = True
-                            veto_reason = "hurst_veto_chop"
-
-                    # OU veto gate
-                    if not vetoed and self.config.ou.veto_enabled:
-                        if self.config.ou.mode == "kalman":
-                            if ou_beta is not None and ou_beta >= 0:
-                                vetoed = True
-                                veto_reason = "ou_veto_explosive"
-                        else:  # ols
-                            if tau_ou is None:
-                                vetoed = True
-                                veto_reason = "ou_veto_non_reverting"
-
-                    # Pockets veto gate
-                    if not vetoed and self.config.pocket.veto_enabled:
-                        if pocket_state in self.config.pocket.exclusion_list:
-                            vetoed = True
-                            veto_reason = f"pocket_veto_{pocket_state.replace(' ', '').replace('|', '_')}"
-
-                    # Timeframe veto gate
-                    if not vetoed and self.config.timeframe.veto_enabled:
-                        if four_hour_offset in self.config.timeframe.exclusion_blocks:
-                            vetoed = True
-                            veto_reason = f"timeframe_veto_block_{four_hour_offset}"
+                            veto_reason = gate_reason
+                            break
 
                     # Update veto metrics
                     if vetoed:
@@ -660,61 +920,41 @@ class UnifiedBacktester:
                         expiries_to_run = [int(chosen_exp)]
 
                     for exp in expiries_to_run:
-                        # Skip if specific state|expiry is excluded in pockets configurations
                         cell_vetoed = vetoed
                         cell_veto_reason = veto_reason
                         
-                        if not cell_vetoed and self.config.pocket.veto_enabled:
-                            cell_key = f"{pocket_state}|{exp}"
-                            if cell_key in self.config.pocket.exclusion_list:
-                                cell_vetoed = True
-                                cell_veto_reason = "pocket_expiry_veto"
-                                self.veto_counts["pocket_expiry_veto"] += 1
+                        # Update context expiry
+                        gate_context.expiry_seconds = exp
 
-                        # B. Bayesian Utility Veto Gate Check
+                        # Evaluate Per-Cell Veto Gates if not already vetoed upstream
+                        if not cell_vetoed:
+                            for gate in self.per_cell_gates:
+                                gate_vetoed, gate_reason = gate.evaluate(gate_context)
+                                if gate_vetoed:
+                                    cell_vetoed = True
+                                    cell_veto_reason = gate_reason
+                                    break
+                            if cell_vetoed:
+                                self.veto_counts[cell_veto_reason] += 1
+
+                        # Bayesian Utility Sizing & Logs
                         bayesian_exp_wr = 0.5
                         bayesian_lower = 0.1
                         bayesian_upper = 0.9
                         opt_fraction = 0.0
                         
-                        if not cell_vetoed and self.config.bayesian.enabled:
-                            # 1. Credible Gate Check
-                            credible_ok = self.bayesian_engine.verify_credible_gate(
-                                pocket_state,
-                                exp,
-                                threshold=self.config.bayesian.breakeven_win_rate,
-                                confidence=self.config.bayesian.confidence_threshold
+                        if self.config.bayesian.enabled:
+                            bayes_state = self.bayesian_engine.get_or_create_state(pocket_state, exp)
+                            bayesian_exp_wr = bayes_state.expected_win_rate
+                            bayesian_lower, bayesian_upper = bayes_state.get_credible_interval(
+                                self.config.bayesian.confidence_threshold
                             )
-                            # 2. Sizing Sizer Check
                             opt_fraction, _ = self.bayesian_engine.calculate_optimal_sizing(
                                 pocket_state,
                                 exp,
                                 payout_pct=self.config.payout_pct,
                                 risk_aversion=self.config.bayesian.risk_aversion,
                                 max_fraction=self.config.bayesian.max_fraction
-                            )
-                            
-                            bayes_state = self.bayesian_engine.get_or_create_state(pocket_state, exp)
-                            bayesian_exp_wr = bayes_state.expected_win_rate
-                            bayesian_lower, bayesian_upper = bayes_state.get_credible_interval(
-                                self.config.bayesian.confidence_threshold
-                            )
-                            
-                            if not credible_ok:
-                                cell_vetoed = True
-                                cell_veto_reason = "bayesian_veto_credible"
-                                self.veto_counts["bayesian_veto_credible"] += 1
-                            elif opt_fraction <= 0.005:  # sizing too small / utility <= 0
-                                cell_vetoed = True
-                                cell_veto_reason = "bayesian_veto_utility"
-                                self.veto_counts["bayesian_veto_utility"] += 1
-                        
-                        elif self.config.bayesian.enabled:
-                            # Still fetch for logging even if vetoed upstream
-                            bayes_state = self.bayesian_engine.get_or_create_state(pocket_state, exp)
-                            bayesian_exp_wr = bayes_state.expected_win_rate
-                            bayesian_lower, bayesian_upper = bayes_state.get_credible_interval(
-                                self.config.bayesian.confidence_threshold
                             )
 
                         expiry_res = evaluate_expiry(ticks, timestamps, tick.timestamp, tick.price, direction, exp)

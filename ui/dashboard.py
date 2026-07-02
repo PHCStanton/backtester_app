@@ -1,9 +1,8 @@
 import streamlit as st
-from backtester_app.ui.tabs.run_sweep import render_run_sweep_tab
-from backtester_app.ui.tabs.optimize import render_optimize_tab
-from backtester_app.ui.tabs.results_viewer import render_results_viewer_tab
-from backtester_app.ui.tabs.ml_explorer import render_ml_explorer_tab
-from backtester_app.ui.tabs.import_data import render_import_tab
+from backtester_app.ui.tabs.switchboard import render_switchboard_tab
+from backtester_app.ui.tabs.results import render_results_tab
+from backtester_app.ui.tabs.explorer import render_explorer_tab
+from backtester_app.ui.tabs.datasets import render_datasets_tab
 
 # Page configuration
 st.set_page_config(
@@ -67,25 +66,21 @@ st.title("🎯 OTC SNIPER — Standalone Backtesting & Calibration App")
 st.markdown("---")
 
 # Render Tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🎯 Run Sweeps",
-    "🧪 Parameter Calibration",
-    "📊 Performance Metrics",
-    "🧬 Bayesian & ML Explorer",
-    "📥 Import Datasets"
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🎯 Switchboard Control",
+    "📊 Performance Results",
+    "🧬 ML & Bayesian Explorer",
+    "📥 Dataset Manager"
 ])
 
 with tab1:
-    render_run_sweep_tab()
+    render_switchboard_tab()
 
 with tab2:
-    render_optimize_tab()
+    render_results_tab()
 
 with tab3:
-    render_results_viewer_tab()
+    render_explorer_tab()
 
 with tab4:
-    render_ml_explorer_tab()
-
-with tab5:
-    render_import_tab()
+    render_datasets_tab()

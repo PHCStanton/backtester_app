@@ -21,6 +21,7 @@ def objective_factory(
     asset: str,
     target_metric: str = "pnl",
     min_trades: int = 15,
+    payout_pct: float = 92.0,
 ) -> Any:
     """
     Creates the objective function for Optuna.
@@ -50,7 +51,7 @@ def objective_factory(
 
         # 2. Build configuration dictionary
         config_dict = {
-            "payout_pct": 92.0,
+            "payout_pct": payout_pct,
             "kalman": {
                 "enabled": kalman_enabled,
                 "q": kalman_q,
@@ -119,10 +120,9 @@ def objective_factory(
                         total_trades += 1
                         if t["outcome"] == "win":
                             total_wins += 1
-                            total_pnl += 0.92
                         elif t["outcome"] == "loss":
                             total_losses += 1
-                            total_pnl -= 1.0
+                        total_pnl += t["net_pl"]
             except Exception:
                 # Silently ignore individual file errors during optimization
                 pass
@@ -150,6 +150,7 @@ def run_optuna_study(
     db_path: Path | None = None,
     study_name: str = "backtest_opt",
     min_trades: int = 15,
+    payout_pct: float = 92.0,
 ) -> Dict[str, Any]:
     """
     Creates and runs an Optuna study.
@@ -166,7 +167,7 @@ def run_optuna_study(
         load_if_exists=True
     )
     
-    objective = objective_factory(dates, asset, target_metric, min_trades)
+    objective = objective_factory(dates, asset, target_metric, min_trades, payout_pct)
     study.optimize(objective, n_trials=n_trials)
     
     return {

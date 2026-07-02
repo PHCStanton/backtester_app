@@ -1,0 +1,20 @@
+# Project Guidelines — Backtester App
+
+## Documentation Requirements
+- Keep all files in `.agent-memory-backtester/` synchronized with architectural modifications.
+- Maintain detailed changelogs inside `Dev_Docs/` for collaborators.
+- README.md must be updated if preset configurations or file locations change.
+
+## Architecture
+- Enforce strict separation of concerns: calculations in `core/`, Streamlit UI in `ui/`.
+- All filters must implement the stateless `FilterGate` protocol.
+- Zero cross-contamination between sequential backtest date iterations; call `reset_trackers()` at file transitions.
+
+## Code Style & Patterns
+- Follow PEP-8 guidelines with strict type-hinting.
+- Resolve all paths relative to REPO_ROOT to prevent environment mismatches.
+- Never use bare try-except blocks that swallow errors silently.
+
+## Testing Standards
+- All changes must pass tests in `test_backtester_engine.py` using `pytest`.
+- Add test coverage for any new filter gate or configuration changes.
