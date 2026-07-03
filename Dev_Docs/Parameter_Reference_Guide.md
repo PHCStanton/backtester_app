@@ -228,8 +228,6 @@ Balances trade frequency and risk management, dynamically adapting contract dura
 *   **Bayesian Gate**: `Enabled` (Confidence = `0.80`, Breakeven = `0.5208`, Risk Aversion = `1.5`)
 *   **Manipulation Gate**: `Enabled` (Severity = `0.40`)
 
----
-
 ### 🔴 Profile C: Raw Indicator Baseline (Discovery Mode)
 Bypasses veto gates to establish a raw performance baseline. Used to verify the edge of the underlying indicator.
 
@@ -240,3 +238,45 @@ Bypasses veto gates to establish a raw performance baseline. Used to verify the 
 *   **Bayesian Gate**: `Disabled`
 *   **Manipulation Gate**: `Disabled`
 *   **Regime Gate**: `Disabled`
+
+---
+
+## 4. Frequently Asked Questions (FAQ) & Calibration Insights
+
+### ❓ 4.1 Which filters conflict or should not be enabled together?
+*   **Kalman Upstream of Hurst + Hurst Veto**: **DO NOT combine these.** Enabling `kalman.upstream_of_hurst` smooths the price sequence before feeding it to the Hurst exponent calculator. This destroys the high-frequency tick variance ("microstructure roughness") that Hurst relies on to estimate fractal dimensionality. As a result, the Hurst estimator will be biased towards random-walk ($H \approx 0.5$) or trending ($H > 0.5$) regimes, preventing valid mean-reverting signals from executing.
+*   **Hurst mean-reversion whitelist + ADX/CCI Trend allowed regimes**: If the Hurst Exponent is set to whitelist only `["mean_reverting"]` (which requires $H < 0.44$), but the ADX/CCI regime gate is set to allow only `["STRONG_MOMENTUM"]` or `["BREAKOUT"]`, they will conflict. The system will veto almost all trades because they are looking for opposite market structures. Keep these in alignment: whitelist `["RANGE_BOUND", "TREND_PULLBACK"]` when restricting to mean-reverting regimes.
+*   **Pocket Exclusions + Bayesian Utility Sizer (Redundancy)**: They do not conflict programmatically, but they are redundant. Pocket exclusions apply a hard-coded blacklist of specific Volatility-Liquidity-Manipulation cells. The Bayesian Utility Sizer dynamically calculates if a cell has a statistically proven positive win-rate probability. If the Bayesian sizer is active with a high confidence threshold, it automatically filters out low-performing cells, making manual pocket blacklists unnecessary.
+
+### ❓ 4.2 What is the difference between Enable Hurst Veto and Enable Raw Hurst Threshold Veto?
+*   **Hurst Veto (`hurst.veto_enabled`)**: This is a **regime-based classification gate**. It maps the calculated $H$ into one of three buckets: `mean_reverting` ($H < 0.44$), `trending` ($H > 0.58$), or `random_walk` (between $0.44$ and $0.58$). It vetoes the signal if the current regime is not inside the `allowed_regimes` whitelist.
+*   **Raw Hurst Threshold Veto (`hurst.filter_threshold`)**: This is a **hard numerical limit**. Regardless of whitelists, if the raw computed Hurst exponent is greater than or equal to the threshold (e.g. `0.48`), it immediately triggers a veto. 
+*   **Usage Recommendation**: For standard setups, use **Enable Hurst Veto** to isolate mean-reverting states. Only use the **Raw Hurst Threshold Veto** if you want a strict safety ceiling (e.g. `0.48`) to block trades as soon as mean reversion weakens, even if it hasn't officially transitioned to a "trending" classification. Using both simultaneously is usually too restrictive.
+
+### ❓ 4.3 What is the Hurst Cutoff Scale (`min_scale_cutoff`)?
+*   The Hurst exponent is estimated by dividing the rolling window of size $N$ into sub-intervals of length $n$ (scales). The rescaled range is computed for each scale, and a log-log regression of rescaled range vs. scale $n$ is run. The slope of this regression is the Hurst exponent $H$.
+*   `min_scale_cutoff` is the minimum sub-interval length $n$ included in this regression. If set to `12` (default), the regression ignores scales smaller than 12 ticks. This is critical because at small scales (e.g. 2, 4, 8 ticks), the price action is dominated by microstructure noise (bid-ask bounce, execution delay) which distorts the estimation of the true long-term fractal memory.
+
+### ❓ 4.4 Does adjusting ADX/CCI parameters make a significant difference?
+*   **Yes, significantly.** ADX and CCI periods dictate how fast the regime classifier responds to changes in trend strength and momentum.
+*   If these are hardcoded, the system might misclassify fast-shifting market states. By making these values adjustable:
+    - **Short periods** (e.g., ADX 8, CCI 14) provide low-latency regime classification but increase noise and false breakout alerts.
+    - **Long periods** (e.g., ADX 20, CCI 30) ensure stable regime tracking but introduce lag, meaning the gate might veto a breakout only after it has already occurred.
+    - **ADX threshold**: Raising the threshold (e.g. from 25 to 30) restricts the definition of a trend, allowing more trades to pass under the range-bound classification.
+
+### ❓ 4.5 How should a user approach OTEO Core Parameters vs. OTEO Signal Gates?
+*   **OTEO Core Parameters**: These dictate the **generation of raw signals**. They should be calibrated first to ensure the underlying indicator has an edge. Adjusting `min_abs_z_score` (minimum trigger threshold) and `cooldown_ticks` changes the raw sensitivity of signal creation.
+*   **OTEO Signal Gates**: These filter signals **after generation** based on their statistics (such as z-score limits or confidence scores). 
+*   **UI/Documentation Ordering**: In the sequential pipeline, the OTEO indicator acts as the source generator. It is logically placed at the **top** of the configuration dashboard, as context filters (Kalman, Hurst, OU) only process signals that OTEO successfully generates first.
+
+### ❓ 4.6 What does the abbreviation OLS stand for in OU Veto?
+*   **OLS** stands for **Ordinary Least Squares**. It is a standard mathematical regression technique used to estimate parameters in a linear model by minimizing the sum of the squared differences between observed values and predictions.
+*   In the Ornstein-Uhlenbeck (OU) veto, OLS is used to fit a linear regression of price changes against prices over a rolling lookback window to determine if the drift coefficient is negative (indicating mean reversion) or positive (indicating explosive expansion).
+
+### ❓ 4.7 How do I apply Optuna calibration results?
+1.  **Run Calibration**: Launch the Optuna optimization study. The algorithm will search thousands of parameter combinations to find the set that maximizes performance (e.g. net profit or win rate).
+2.  **Extract Parameters**: At the end of the study, Optuna outputs the **Best Parameters** (e.g., `kalman_q = 1.2e-9`, `hurst_mean_revert_limit = 0.43`).
+3.  **Apply to UI/Config**: Enter these optimal values into the **Switchboard Control Center** input fields.
+4.  **Save as Preset**: Click to save the configuration as a new JSON file (e.g. `optuna_opt_usd_otc.json`) in the `configs/` directory.
+5.  **Validate**: Run a backtest sweep on a different, unseen date range (out-of-sample data) using this preset to ensure the settings are robust and not overfitted.
+
