@@ -15,12 +15,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backtester_app.core.engine import UnifiedBacktester, UnifiedBacktestConfig
-from backtester_app.core.statement import POStatementReplayer
 from backtester_app.core.optimizer import run_optuna_study
 
 CONFIG_ROOT = REPO_ROOT / "configs"
 TICK_ROOT = REPO_ROOT / "app/data/tick_logs"
-STATEMENT_ROOT = REPO_ROOT / "app/data/PO_STATEMENTS"
 
 def load_presets() -> dict[str, Path]:
     CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -51,14 +49,19 @@ def render_switchboard_tab():
         st.session_state["switchboard_config"] = {
             "payout_pct": 92.0,
             "kalman": {"enabled": False, "q": 1e-9, "r": 1e-7, "upstream_of_hurst": False},
-            "hurst": {"veto_enabled": False, "window_size": 300, "mean_revert_limit": 0.44, "trend_limit": 0.58},
+            "hurst": {"veto_enabled": False, "window_size": 300, "mean_revert_limit": 0.44, "trend_limit": 0.58, "allowed_regimes": ["mean_reverting", "random_walk", "trending"], "filter_threshold": None, "min_scale_cutoff": 12},
             "ou": {"veto_enabled": False, "mode": "kalman", "window_size": 300, "q_c": 1e-10, "q_beta": 1e-6, "r": 1e-8},
             "expiry": {"mode": "static", "static_seconds": [60, 120, 300], "adaptive_c": 10.0, "adaptive_bounds": [30, 60, 120, 300]},
             "indicator": {"level_mode": "L3", "cooldown_ticks": 30},
-            "pocket": {"veto_enabled": False, "exclusion_list": []},
+            "pocket": {"veto_enabled": False, "exclusion_list": [], "blacklist_assets": []},
             "timeframe": {"veto_enabled": False, "exclusion_blocks": []},
             "bayesian": {"enabled": False, "alpha_prior": 2.0, "beta_prior": 2.0, "confidence_threshold": 0.90, "breakeven_win_rate": 0.5208, "risk_aversion": 2.0, "max_fraction": 0.10},
-            "manipulation": {"veto_enabled": False, "min_severity_level": "HIGH"}
+            "manipulation": {"veto_enabled": False, "severity_threshold": 0.3},
+            "oteo_gate": {"min_zscore_enabled": False, "min_zscore": 0.0, "max_zscore_enabled": False, "max_zscore": 10.0, "min_score_enabled": False, "min_score": 0.0, "max_score_enabled": False, "max_score": 100.0},
+            "regime": {"enabled": False, "allowed_regimes": [], "require_stable": False},
+            "oteo_params": {"min_abs_z_score": 0.35, "min_pressure_pct": 12.0, "score_center": 0.85, "score_slope": 3.5, "cooldown_ticks": 30, "buffer_size": 300, "pressure_window": 24, "macro_window": 120},
+            "volatility": {"high_ratio": 2.0, "medium_ratio": 1.2},
+            "liquidity": {"high_freq": 40.0, "medium_freq": 15.0}
         }
 
     # Preset dropdown selector
@@ -99,6 +102,25 @@ def render_switchboard_tab():
             cfg["hurst"]["window_size"] = st.number_input("Rolling Window Size", value=int(cfg["hurst"]["window_size"]), min_value=50, max_value=2000, step=50)
             cfg["hurst"]["mean_revert_limit"] = st.slider("Mean-Reverting Threshold (< H)", 0.20, 0.50, float(cfg["hurst"]["mean_revert_limit"]), step=0.01)
             cfg["hurst"]["trend_limit"] = st.slider("Trending Threshold (> H)", 0.50, 0.80, float(cfg["hurst"]["trend_limit"]), step=0.01)
+            
+            st.markdown("**Allowed Regimes (Whitelist)**")
+            allow_mr = st.checkbox("Allow Mean-Reverting (< MR Threshold)", value="mean_reverting" in cfg["hurst"].get("allowed_regimes", ["mean_reverting", "random_walk", "trending"]))
+            allow_rw = st.checkbox("Allow Random Walk (MR to Trend Threshold)", value="random_walk" in cfg["hurst"].get("allowed_regimes", ["mean_reverting", "random_walk", "trending"]))
+            allow_tr = st.checkbox("Allow Trending (> Trend Threshold)", value="trending" in cfg["hurst"].get("allowed_regimes", ["mean_reverting", "random_walk", "trending"]))
+            
+            allowed = []
+            if allow_mr: allowed.append("mean_reverting")
+            if allow_rw: allowed.append("random_walk")
+            if allow_tr: allowed.append("trending")
+            cfg["hurst"]["allowed_regimes"] = allowed
+
+            thresh_enabled = st.checkbox("Enable Raw Hurst Threshold Veto", value=cfg["hurst"].get("filter_threshold") is not None)
+            if thresh_enabled:
+                cfg["hurst"]["filter_threshold"] = st.slider("Veto if Raw H >= Threshold", 0.20, 0.90, float(cfg["hurst"].get("filter_threshold") or 0.48), step=0.01)
+            else:
+                cfg["hurst"]["filter_threshold"] = None
+                
+            cfg["hurst"]["min_scale_cutoff"] = st.number_input("Hurst Min Scale Cutoff", value=int(cfg["hurst"].get("min_scale_cutoff", 12)), min_value=4, max_value=30, step=1)
 
         # OU Veto
         with st.expander("🌀 Ornstein-Uhlenbeck Veto", expanded=cfg["ou"]["veto_enabled"]):
@@ -138,13 +160,57 @@ def render_switchboard_tab():
             cfg["pocket"]["veto_enabled"] = st.checkbox("Enable Pocket Veto", value=cfg["pocket"]["veto_enabled"], key="pocket_enable")
             pockets_str = st.text_area("Exclusion States / Expiry Cells (one per line)", value="\n".join(cfg["pocket"]["exclusion_list"]))
             cfg["pocket"]["exclusion_list"] = [x.strip() for x in pockets_str.split("\n") if x.strip()]
+            blacklist_str = st.text_input("Asset Blacklist (comma separated)", value=",".join(cfg["pocket"].get("blacklist_assets", [])))
+            cfg["pocket"]["blacklist_assets"] = [x.strip() for x in blacklist_str.split(",") if x.strip()]
 
         # Manipulation Veto
         with st.expander("🚨 Manipulation Gate", expanded=cfg["manipulation"]["veto_enabled"]):
             cfg["manipulation"]["veto_enabled"] = st.checkbox("Enable Manipulation Veto", value=cfg["manipulation"]["veto_enabled"], key="manip_enable")
-            cfg["manipulation"]["min_severity_level"] = st.selectbox("Min Veto Severity Level", ["HIGH", "MEDIUM", "LOW"], index=["HIGH", "MEDIUM", "LOW"].index(cfg["manipulation"]["min_severity_level"]))
+            cfg["manipulation"]["severity_threshold"] = st.slider("Severity Threshold Veto (>= value)", 0.0, 1.0, float(cfg["manipulation"].get("severity_threshold", 0.3)), step=0.05)
 
-        # Save configuration
+        # OTEO Signal Gate
+        with st.expander("🎯 OTEO Signal Gate", expanded=cfg["oteo_gate"]["min_zscore_enabled"] or cfg["oteo_gate"]["min_score_enabled"]):
+            cfg["oteo_gate"]["min_zscore_enabled"] = st.checkbox("Enable Min Z-Score Veto", value=cfg["oteo_gate"]["min_zscore_enabled"])
+            if cfg["oteo_gate"]["min_zscore_enabled"]:
+                cfg["oteo_gate"]["min_zscore"] = st.number_input("Min Z-Score", value=float(cfg["oteo_gate"]["min_zscore"]), step=0.1)
+            cfg["oteo_gate"]["max_zscore_enabled"] = st.checkbox("Enable Max Z-Score Veto", value=cfg["oteo_gate"]["max_zscore_enabled"])
+            if cfg["oteo_gate"]["max_zscore_enabled"]:
+                cfg["oteo_gate"]["max_zscore"] = st.number_input("Max Z-Score", value=float(cfg["oteo_gate"]["max_zscore"]), step=0.1)
+            cfg["oteo_gate"]["min_score_enabled"] = st.checkbox("Enable Min Score Veto", value=cfg["oteo_gate"]["min_score_enabled"])
+            if cfg["oteo_gate"]["min_score_enabled"]:
+                cfg["oteo_gate"]["min_score"] = st.slider("Min OTEO Score", 0.0, 100.0, float(cfg["oteo_gate"]["min_score"]), step=5.0)
+            cfg["oteo_gate"]["max_score_enabled"] = st.checkbox("Enable Max Score Veto", value=cfg["oteo_gate"]["max_score_enabled"])
+            if cfg["oteo_gate"]["max_score_enabled"]:
+                cfg["oteo_gate"]["max_score"] = st.slider("Max OTEO Score", 0.0, 100.0, float(cfg["oteo_gate"]["max_score"]), step=5.0)
+
+        # Regime Classifier Gate
+        with st.expander("📈 ADX/CCI Market Regime Gate", expanded=cfg["regime"]["enabled"]):
+            cfg["regime"]["enabled"] = st.checkbox("Enable Regime Gate", value=cfg["regime"]["enabled"])
+            cfg["regime"]["require_stable"] = st.checkbox("Require Stable Regime (persistence >= 3)", value=cfg["regime"]["require_stable"])
+            regimes_str = st.text_input("Allowed Regimes (comma separated, e.g. RANGE_BOUND,TREND_PULLBACK)", value=",".join(cfg["regime"].get("allowed_regimes", [])))
+            cfg["regime"]["allowed_regimes"] = [x.strip() for x in regimes_str.split(",") if x.strip()]
+
+        # OTEO Core Parameters Calibration
+        with st.expander("🎛️ OTEO Core Parameters", expanded=False):
+            cfg["oteo_params"]["min_abs_z_score"] = st.slider("OTEO Min Abs Z-Score", 0.1, 1.0, float(cfg["oteo_params"]["min_abs_z_score"]), step=0.05)
+            cfg["oteo_params"]["min_pressure_pct"] = st.slider("OTEO Min Pressure Pct", 1.0, 50.0, float(cfg["oteo_params"]["min_pressure_pct"]), step=1.0)
+            cfg["oteo_params"]["score_center"] = st.slider("OTEO Score Center (sigmoid offset)", 0.3, 2.0, float(cfg["oteo_params"]["score_center"]), step=0.05)
+            cfg["oteo_params"]["score_slope"] = st.slider("OTEO Score Slope", 1.0, 10.0, float(cfg["oteo_params"]["score_slope"]), step=0.1)
+            cfg["oteo_params"]["cooldown_ticks"] = st.number_input("OTEO Cooldown Ticks", value=int(cfg["oteo_params"]["cooldown_ticks"]), min_value=0, max_value=500, step=5)
+            cfg["oteo_params"]["buffer_size"] = st.number_input("OTEO Buffer Size", value=int(cfg["oteo_params"]["buffer_size"]), min_value=50, max_value=1000, step=50)
+            cfg["oteo_params"]["pressure_window"] = st.number_input("OTEO Pressure Window", value=int(cfg["oteo_params"]["pressure_window"]), min_value=5, max_value=100, step=5)
+            cfg["oteo_params"]["macro_window"] = st.number_input("OTEO Macro Window", value=int(cfg["oteo_params"]["macro_window"]), min_value=20, max_value=500, step=10)
+
+        # Volatility & Liquidity Thresholds
+        with st.expander("🌊 Volatility & Liquidity Thresholds", expanded=False):
+            st.markdown("**Volatility (Fast / Slow Standard Deviation ratio)**")
+            cfg["volatility"]["high_ratio"] = st.number_input("High Volatility Ratio Threshold", value=float(cfg["volatility"]["high_ratio"]), step=0.1)
+            cfg["volatility"]["medium_ratio"] = st.number_input("Medium Volatility Ratio Threshold", value=float(cfg["volatility"]["medium_ratio"]), step=0.1)
+            st.markdown("**Liquidity (Ticks per minute frequency)**")
+            cfg["liquidity"]["high_freq"] = st.number_input("High Liquidity Freq Threshold", value=float(cfg["liquidity"]["high_freq"]), step=1.0)
+            cfg["liquidity"]["medium_freq"] = st.number_input("Medium Liquidity Freq Threshold", value=float(cfg["liquidity"]["medium_freq"]), step=1.0)
+
+        # Save & Export configurations
         st.markdown("---")
         save_col1, save_col2 = st.columns(2)
         with save_col1:
@@ -157,6 +223,22 @@ def render_switchboard_tab():
                 with open(target_path, "w", encoding="utf-8") as out:
                     json.dump(cfg, out, indent=2)
                 st.success(f"Saved: {target_path.name}")
+                st.rerun()
+
+        export_col1, export_col2 = st.columns(2)
+        with export_col1:
+            ghost_name = st.text_input("Auto Ghost Export Name", "auto_ghost_preset")
+        with export_col2:
+            st.write("")
+            st.write("")
+            if st.button("🚀 Export to Ghost Protocol"):
+                from backtester_app.core.config_bridge import backtester_to_ghost_protocol
+                temp_cfg = UnifiedBacktestConfig.from_dict(cfg)
+                ghost_dict = backtester_to_ghost_protocol(temp_cfg)
+                target_path = CONFIG_ROOT / f"{ghost_name}.json"
+                with open(target_path, "w", encoding="utf-8") as out:
+                    json.dump(ghost_dict, out, indent=2)
+                st.success(f"Exported: {target_path.name}")
                 st.rerun()
 
     with right_pane:
@@ -179,28 +261,8 @@ def render_switchboard_tab():
         # Execution Mode
         exec_mode = st.selectbox("Execution Mode", ["Single Backtest Sweep", "Optuna Hyperparameter Calibration"])
         
-        # Data Source selector
-        data_source = st.radio("Primary Data Source", ["Tick Logs (Simulation)", "Pocket Option Statement Replay"], horizontal=True)
-
-        if data_source == "Pocket Option Statement Replay":
-            st.info("PO Statement replay matches real executed statement records against tick logs temporal timestamps.")
-            STATEMENT_ROOT.mkdir(parents=True, exist_ok=True)
-            stmt_files = sorted([f.name for f in STATEMENT_ROOT.glob("*.*") if f.suffix.lower() in [".xlsx", ".xls", ".csv"]])
-            if not stmt_files:
-                st.warning("No PO Statements found in app/data/PO_STATEMENTS/. Please upload one first.")
-                uploaded_stmt = st.file_uploader("Upload Statement (Excel/CSV)", type=["xlsx", "xls", "csv"])
-                if uploaded_stmt:
-                    save_path = STATEMENT_ROOT / uploaded_stmt.name
-                    with open(save_path, "wb") as f:
-                        f.write(uploaded_stmt.getbuffer())
-                    st.success("File uploaded successfully. Refreshing list...")
-                    st.rerun()
-                selected_stmt = None
-            else:
-                selected_stmt = st.selectbox("Select Statement File", stmt_files)
-                offset_val = st.number_input("Timezone Offset Hours (UTC)", value=0, step=1)
-        else:
-            selected_stmt = None
+        data_source = "Tick Logs (Simulation)"
+        selected_stmt = None
 
         if exec_mode == "Optuna Hyperparameter Calibration":
             st.subheader("⚙️ Calibration Settings")
@@ -282,52 +344,7 @@ def render_switchboard_tab():
                             fig = px.line(df_executed, x="entry_time", y="cum_pnl", title="Cumulative Equity Curve", template="plotly_dark")
                             st.plotly_chart(fig, use_container_width=True)
 
-                else:
-                    # PO STATEMENT REPLAY RUN
-                    if not selected_stmt:
-                        st.error("No statement file selected.")
-                        return
-                    status_placeholder.info("⚙️ Initializing PO statement replayer...")
-                    engine_config = UnifiedBacktestConfig.from_dict(cfg)
-                    replayer = POStatementReplayer(engine_config)
-                    
-                    try:
-                        results = replayer.replay(STATEMENT_ROOT / selected_stmt, offset_override=float(offset_val * 3600))
-                        progress_bar.progress(1.0)
-                        status_placeholder.empty()
-                        
-                        if not results:
-                            st.warning("PO Statement Replay complete, but no matches were found in tick logs.")
-                        else:
-                            st.success(f"✅ PO Statement Replay complete. Matched {len(results)} trades.")
-                            df_res = pd.DataFrame(results)
-                            st.session_state["last_run_df"] = df_res
-                            st.session_state["last_run_asset"] = "PO_Statement"
-                            st.session_state["last_run_completed"] = True
-                            
-                            df_executed = df_res[df_res["outcome"] != "draw"]
-                            total = len(df_executed)
-                            wins = len(df_executed[df_executed["outcome"] == "win"])
-                            wr = (wins / total * 100.0) if total else 0.0
-                            
-                            # Net P/L calculation
-                            net_pnl = 0.0
-                            for _, row in df_res.iterrows():
-                                if row["stack_aligned"]:
-                                    if row["outcome"] == "win":
-                                        net_pnl += row["profit"]
-                                    elif row["outcome"] == "loss":
-                                        net_pnl -= row["amount"]
 
-                            st.markdown("### Replay Performance Output")
-                            col_s1, col_s2, col_s3 = st.columns(3)
-                            col_s1.metric("Total Trades", total)
-                            col_s2.metric("Win-Rate", f"{wr:.2f}%")
-                            col_s3.metric("Net P/L (Aligned)", f"${net_pnl:.2f}")
-                    except Exception as ex:
-                        st.error(f"Failed to run PO Statement Replay: {ex}")
-                        import traceback
-                        st.code(traceback.format_exc())
 
             else:
                 # OPTUNA CALIBRATION

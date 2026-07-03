@@ -3,6 +3,7 @@ from backtester_app.ui.tabs.switchboard import render_switchboard_tab
 from backtester_app.ui.tabs.results import render_results_tab
 from backtester_app.ui.tabs.explorer import render_explorer_tab
 from backtester_app.ui.tabs.datasets import render_datasets_tab
+from backtester_app.ui.tabs.how_it_works import render_how_it_works_tab
 
 # Page configuration
 st.set_page_config(
@@ -66,11 +67,12 @@ st.title("🎯 OTC SNIPER — Standalone Backtesting & Calibration App")
 st.markdown("---")
 
 # Render Tabs
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🎯 Switchboard Control",
     "📊 Performance Results",
     "🧬 ML & Bayesian Explorer",
-    "📥 Dataset Manager"
+    "📥 Dataset Manager",
+    "📖 How it Works"
 ])
 
 with tab1:
@@ -84,3 +86,6 @@ with tab3:
 
 with tab4:
     render_datasets_tab()
+
+with tab5:
+    render_how_it_works_tab()

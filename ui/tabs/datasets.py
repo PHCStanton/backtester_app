@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
 # Paths
 TICK_ROOT = REPO_ROOT / "app/data/tick_logs"
 BACKUP_ROOT = REPO_ROOT / "app/data/backup_data"
-STATEMENT_ROOT = REPO_ROOT / "app/data/PO_STATEMENTS"
 
 # OHLCV Auto-Detection helper globals and functions
 OHLCV_TIMESTAMP_ALIASES = {"time", "timestamp", "date", "datetime", "ts"}
@@ -63,12 +62,8 @@ def _parse_timestamp(raw_t, ts_format: str, custom_format: str, source_tz) -> fl
 def render_datasets_tab():
     st.header("📥 Dataset Manager")
     
-    tab_import, tab_statements = st.tabs([
-        "📥 Convert Tick & Candle Backups",
-        "📄 Upload Pocket Option Statements"
-    ])
-
-    with tab_import:
+    # Render tick log conversion directly
+    if True:
         st.subheader("Convert Backup Datasets")
         st.markdown(
             "Convert raw CSV files (OHLCV candle or tick format) from the backup directory "
@@ -320,34 +315,4 @@ def render_datasets_tab():
                 else:
                     st.error("No tick log files were written. Check parameters.")
 
-    with tab_statements:
-        st.subheader("Upload and Manage Pocket Option Statements")
-        st.markdown(
-            "Upload Excel `.xlsx`/`.xls` or `.csv` files showing your real trade execution history "
-            "so you can replay them in the switchboard replayer."
-        )
 
-        STATEMENT_ROOT.mkdir(parents=True, exist_ok=True)
-
-        # File uploader
-        uploaded_file = st.file_uploader("Choose Statement Excel/CSV File", type=["xlsx", "xls", "csv"], key="po_upload")
-        if uploaded_file is not None:
-            save_path = STATEMENT_ROOT / uploaded_file.name
-            with open(save_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            st.success(f"Successfully uploaded and saved: `{uploaded_file.name}`")
-
-        # List existing files
-        st.markdown("---")
-        st.markdown("### Existing Uploaded Statement Files")
-        stmt_files = sorted([f for f in STATEMENT_ROOT.glob("*.*") if f.suffix.lower() in [".xlsx", ".xls", ".csv"]])
-        if not stmt_files:
-            st.info("No statement files found in `app/data/PO_STATEMENTS/` directory.")
-        else:
-            for idx, file in enumerate(stmt_files):
-                col_fn, col_del = st.columns([5, 1])
-                col_fn.markdown(f"📄 `{file.name}` ({file.stat().st_size / 1024:.1f} KB)")
-                if col_del.button("🗑️ Delete", key=f"del_{idx}"):
-                    file.unlink()
-                    st.success(f"Deleted: `{file.name}`")
-                    st.rerun()

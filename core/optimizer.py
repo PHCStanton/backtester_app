@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 import sys
+import logging
 from pathlib import Path
 from typing import Any, List, Dict
 import optuna
+
+logger = logging.getLogger(__name__)
 
 # Adjust sys.path to REPO_ROOT
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +51,12 @@ def objective_factory(
         # Expiry config
         expiry_mode = trial.suggest_categorical("expiry_mode", ["static", "adaptive"])
         adaptive_c = trial.suggest_float("expiry_adaptive_c", 5.0, 50.0)
+
+        # OTEO core tuning
+        oteo_min_abs_z = trial.suggest_float("oteo_min_abs_z_score", 0.1, 1.0)
+        oteo_score_center = trial.suggest_float("oteo_score_center", 0.5, 1.5)
+        oteo_score_slope = trial.suggest_float("oteo_score_slope", 1.5, 6.0)
+        oteo_min_pressure = trial.suggest_float("oteo_min_pressure_pct", 5.0, 25.0)
 
         # 2. Build configuration dictionary
         config_dict = {
@@ -96,6 +105,12 @@ def objective_factory(
             },
             "bayesian": {
                 "enabled": False  # keep Bayesian off during standard parameter search
+            },
+            "oteo_params": {
+                "min_abs_z_score": oteo_min_abs_z,
+                "score_center": oteo_score_center,
+                "score_slope": oteo_score_slope,
+                "min_pressure_pct": oteo_min_pressure,
             }
         }
 
@@ -123,9 +138,9 @@ def objective_factory(
                         elif t["outcome"] == "loss":
                             total_losses += 1
                         total_pnl += t["net_pl"]
-            except Exception:
-                # Silently ignore individual file errors during optimization
-                pass
+            except Exception as e:
+                # Log warning for individual file errors during optimization
+                logger.warning(f"Failed to run backtest on {file_path} during trial {trial.number}: {e}")
 
         # 4. Check trade count constraints
         if total_trades < min_trades:

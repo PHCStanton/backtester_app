@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 import sys
 from collections import deque, defaultdict
@@ -10,13 +11,15 @@ from pathlib import Path
 from typing import Any, Sequence, Tuple, Dict, Protocol
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 # Adjust sys.path to REPO_ROOT
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from app.backend.services.market_context import MarketContextEngine, apply_level2_policy, apply_level3_policy
-from app.backend.services.oteo import OTEO
+from app.backend.services.oteo import OTEO, OTEOConfig
 from app.backend.services.regime_classifier import RegimeClassifier
 from app.backend.services.manipulation import ManipulationDetector
 
@@ -37,6 +40,9 @@ class HurstConfig:
     window_size: int = 300
     mean_revert_limit: float = 0.44
     trend_limit: float = 0.58
+    allowed_regimes: list[str] = field(default_factory=lambda: ["mean_reverting", "random_walk", "trending"])
+    filter_threshold: float | None = None
+    min_scale_cutoff: int = 12
 
 @dataclass
 class OUConfig:
@@ -63,6 +69,7 @@ class IndicatorConfig:
 class PocketConfig:
     veto_enabled: bool = False
     exclusion_list: list[str] = field(default_factory=list)
+    blacklist_assets: list[str] = field(default_factory=list)
 
 @dataclass
 class TimeframeConfig:
@@ -82,7 +89,45 @@ class BayesianConfig:
 @dataclass
 class ManipulationConfig:
     veto_enabled: bool = False
-    min_severity_level: str = "HIGH"  # "HIGH", "MEDIUM", or "LOW"
+    severity_threshold: float = 0.3
+
+@dataclass
+class OTEOGateConfig:
+    min_zscore_enabled: bool = False
+    min_zscore: float = 0.0
+    max_zscore_enabled: bool = False
+    max_zscore: float = 10.0
+    min_score_enabled: bool = False
+    min_score: float = 0.0
+    max_score_enabled: bool = False
+    max_score: float = 100.0
+
+@dataclass
+class RegimeGateConfig:
+    enabled: bool = False
+    allowed_regimes: list[str] = field(default_factory=list)
+    require_stable: bool = False
+
+@dataclass
+class OTEOParamsConfig:
+    min_abs_z_score: float = 0.35
+    min_pressure_pct: float = 12.0
+    score_center: float = 0.85
+    score_slope: float = 3.5
+    cooldown_ticks: int = 30
+    buffer_size: int = 300
+    pressure_window: int = 24
+    macro_window: int = 120
+
+@dataclass
+class VolatilityConfig:
+    high_ratio: float = 2.0
+    medium_ratio: float = 1.2
+
+@dataclass
+class LiquidityConfig:
+    high_freq: float = 40.0
+    medium_freq: float = 15.0
 
 @dataclass
 class UnifiedBacktestConfig:
@@ -96,6 +141,11 @@ class UnifiedBacktestConfig:
     timeframe: TimeframeConfig = field(default_factory=TimeframeConfig)
     bayesian: BayesianConfig = field(default_factory=BayesianConfig)
     manipulation: ManipulationConfig = field(default_factory=ManipulationConfig)
+    oteo_gate: OTEOGateConfig = field(default_factory=OTEOGateConfig)
+    regime: RegimeGateConfig = field(default_factory=RegimeGateConfig)
+    oteo_params: OTEOParamsConfig = field(default_factory=OTEOParamsConfig)
+    volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
+    liquidity: LiquidityConfig = field(default_factory=LiquidityConfig)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UnifiedBacktestConfig:
@@ -108,6 +158,11 @@ class UnifiedBacktestConfig:
         timeframe_data = data.get("timeframe", {})
         bayesian_data = data.get("bayesian", {})
         manipulation_data = data.get("manipulation", {})
+        oteo_gate_data = data.get("oteo_gate", {})
+        regime_data = data.get("regime", {})
+        oteo_params_data = data.get("oteo_params", {})
+        volatility_data = data.get("volatility", {})
+        liquidity_data = data.get("liquidity", {})
 
         return cls(
             payout_pct=float(data.get("payout_pct", 92.0)),
@@ -122,6 +177,9 @@ class UnifiedBacktestConfig:
                 window_size=int(hurst_data.get("window_size", 300)),
                 mean_revert_limit=float(hurst_data.get("mean_revert_limit", 0.44)),
                 trend_limit=float(hurst_data.get("trend_limit", 0.58)),
+                allowed_regimes=list(hurst_data.get("allowed_regimes", ["mean_reverting", "random_walk", "trending"])),
+                filter_threshold=float(hurst_data.get("filter_threshold")) if hurst_data.get("filter_threshold") is not None else None,
+                min_scale_cutoff=int(hurst_data.get("min_scale_cutoff", 12)),
             ),
             ou=OUConfig(
                 veto_enabled=bool(ou_data.get("veto_enabled", False)),
@@ -144,6 +202,7 @@ class UnifiedBacktestConfig:
             pocket=PocketConfig(
                 veto_enabled=bool(pocket_data.get("veto_enabled", False)),
                 exclusion_list=list(pocket_data.get("exclusion_list", [])),
+                blacklist_assets=list(pocket_data.get("blacklist_assets", [])),
             ),
             timeframe=TimeframeConfig(
                 veto_enabled=bool(timeframe_data.get("veto_enabled", False)),
@@ -160,7 +219,46 @@ class UnifiedBacktestConfig:
             ),
             manipulation=ManipulationConfig(
                 veto_enabled=bool(manipulation_data.get("veto_enabled", False)),
-                min_severity_level=str(manipulation_data.get("min_severity_level", "HIGH")),
+                severity_threshold=float(
+                    manipulation_data.get("severity_threshold", 
+                        {"LOW": 0.1, "MEDIUM": 0.3, "HIGH": 0.7}.get(
+                            manipulation_data.get("min_severity_level"), 0.3
+                        )
+                    )
+                ),
+            ),
+            oteo_gate=OTEOGateConfig(
+                min_zscore_enabled=bool(oteo_gate_data.get("min_zscore_enabled", False)),
+                min_zscore=float(oteo_gate_data.get("min_zscore", 0.0)),
+                max_zscore_enabled=bool(oteo_gate_data.get("max_zscore_enabled", False)),
+                max_zscore=float(oteo_gate_data.get("max_zscore", 10.0)),
+                min_score_enabled=bool(oteo_gate_data.get("min_score_enabled", False)),
+                min_score=float(oteo_gate_data.get("min_score", 0.0)),
+                max_score_enabled=bool(oteo_gate_data.get("max_score_enabled", False)),
+                max_score=float(oteo_gate_data.get("max_score", 100.0)),
+            ),
+            regime=RegimeGateConfig(
+                enabled=bool(regime_data.get("enabled", False)),
+                allowed_regimes=list(regime_data.get("allowed_regimes", [])),
+                require_stable=bool(regime_data.get("require_stable", False)),
+            ),
+            oteo_params=OTEOParamsConfig(
+                min_abs_z_score=float(oteo_params_data.get("min_abs_z_score", 0.35)),
+                min_pressure_pct=float(oteo_params_data.get("min_pressure_pct", 12.0)),
+                score_center=float(oteo_params_data.get("score_center", 0.85)),
+                score_slope=float(oteo_params_data.get("score_slope", 3.5)),
+                cooldown_ticks=int(oteo_params_data.get("cooldown_ticks", 30)),
+                buffer_size=int(oteo_params_data.get("buffer_size", 300)),
+                pressure_window=int(oteo_params_data.get("pressure_window", 24)),
+                macro_window=int(oteo_params_data.get("macro_window", 120)),
+            ),
+            volatility=VolatilityConfig(
+                high_ratio=float(volatility_data.get("high_ratio", 2.0)),
+                medium_ratio=float(volatility_data.get("medium_ratio", 1.2)),
+            ),
+            liquidity=LiquidityConfig(
+                high_freq=float(liquidity_data.get("high_freq", 40.0)),
+                medium_freq=float(liquidity_data.get("medium_freq", 15.0)),
             ),
         )
 
@@ -178,6 +276,9 @@ class UnifiedBacktestConfig:
                 "window_size": self.hurst.window_size,
                 "mean_revert_limit": self.hurst.mean_revert_limit,
                 "trend_limit": self.hurst.trend_limit,
+                "allowed_regimes": self.hurst.allowed_regimes,
+                "filter_threshold": self.hurst.filter_threshold,
+                "min_scale_cutoff": self.hurst.min_scale_cutoff,
             },
             "ou": {
                 "veto_enabled": self.ou.veto_enabled,
@@ -200,6 +301,7 @@ class UnifiedBacktestConfig:
             "pocket": {
                 "veto_enabled": self.pocket.veto_enabled,
                 "exclusion_list": self.pocket.exclusion_list,
+                "blacklist_assets": self.pocket.blacklist_assets,
             },
             "timeframe": {
                 "veto_enabled": self.timeframe.veto_enabled,
@@ -216,7 +318,40 @@ class UnifiedBacktestConfig:
             },
             "manipulation": {
                 "veto_enabled": self.manipulation.veto_enabled,
-                "min_severity_level": self.manipulation.min_severity_level,
+                "severity_threshold": self.manipulation.severity_threshold,
+            },
+            "oteo_gate": {
+                "min_zscore_enabled": self.oteo_gate.min_zscore_enabled,
+                "min_zscore": self.oteo_gate.min_zscore,
+                "max_zscore_enabled": self.oteo_gate.max_zscore_enabled,
+                "max_zscore": self.oteo_gate.max_zscore,
+                "min_score_enabled": self.oteo_gate.min_score_enabled,
+                "min_score": self.oteo_gate.min_score,
+                "max_score_enabled": self.oteo_gate.max_score_enabled,
+                "max_score": self.oteo_gate.max_score,
+            },
+            "regime": {
+                "enabled": self.regime.enabled,
+                "allowed_regimes": self.regime.allowed_regimes,
+                "require_stable": self.regime.require_stable,
+            },
+            "oteo_params": {
+                "min_abs_z_score": self.oteo_params.min_abs_z_score,
+                "min_pressure_pct": self.oteo_params.min_pressure_pct,
+                "score_center": self.oteo_params.score_center,
+                "score_slope": self.oteo_params.score_slope,
+                "cooldown_ticks": self.oteo_params.cooldown_ticks,
+                "buffer_size": self.oteo_params.buffer_size,
+                "pressure_window": self.oteo_params.pressure_window,
+                "macro_window": self.oteo_params.macro_window,
+            },
+            "volatility": {
+                "high_ratio": self.volatility.high_ratio,
+                "medium_ratio": self.volatility.medium_ratio,
+            },
+            "liquidity": {
+                "high_freq": self.liquidity.high_freq,
+                "medium_freq": self.liquidity.medium_freq,
             }
         }
 
@@ -313,9 +448,10 @@ class ParameterKalmanTracker:
         return 0.0, float(self.beta)
 
 class UnifiedHurstTracker:
-    def __init__(self, window_size: int, mean_revert_limit: float, trend_limit: float) -> None:
+    def __init__(self, window_size: int, mean_revert_limit: float, trend_limit: float, min_scale_cutoff: int = 12) -> None:
         self.mean_revert_limit = mean_revert_limit
         self.trend_limit = trend_limit
+        self.min_scale_cutoff = min_scale_cutoff
         self.prices = deque(maxlen=window_size)
         self.regime = "random_walk"
         self.last_h = 0.5
@@ -329,7 +465,8 @@ class UnifiedHurstTracker:
             return 0.5
         returns = np.diff(np.log(prices_arr))
         N = len(returns)
-        scales = [16, 32, 64, 128, 256]
+        # Generate scales dynamically based on min_scale_cutoff
+        scales = [self.min_scale_cutoff, self.min_scale_cutoff * 2, self.min_scale_cutoff * 4, self.min_scale_cutoff * 8, self.min_scale_cutoff * 16]
         rs_list = []
         for scale in scales:
             if N < scale:
@@ -351,7 +488,8 @@ class UnifiedHurstTracker:
             h, _ = np.polyfit(np.log(scales[:len(rs_list)]), np.log(rs_list), 1)
             self.last_h = float(np.clip(h, 0.0, 1.0))
             return self.last_h
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Polyfit failed in Hurst estimation: {e}")
             return self.last_h
 
     def update_regime(self) -> str:
@@ -375,8 +513,21 @@ class PocketTracker:
         self.last_price: float | None = None
         self.tick_timestamps: deque[float] = deque(maxlen=60)
         self.manip_detector = ManipulationDetector()
+        self.last_push_snap: float = 0.0
+        self.last_pinning: float = 0.0
 
-    def update(self, timestamp: float, price: float) -> tuple[str, str, str, str]:
+    def update(
+        self,
+        timestamp: float,
+        price: float,
+        volatility_cfg: VolatilityConfig | None = None,
+        liquidity_cfg: LiquidityConfig | None = None
+    ) -> tuple[str, str, str, str]:
+        high_vol_ratio = volatility_cfg.high_ratio if volatility_cfg else 2.0
+        medium_vol_ratio = volatility_cfg.medium_ratio if volatility_cfg else 1.2
+        high_liq_freq = liquidity_cfg.high_freq if liquidity_cfg else 40.0
+        medium_liq_freq = liquidity_cfg.medium_freq if liquidity_cfg else 15.0
+
         vol_level = "LOW"
         if self.last_price is not None and self.last_price > 0 and price > 0:
             log_ret = math.log(price / self.last_price)
@@ -386,9 +537,9 @@ class PocketTracker:
                 std_fast = np.std(fast_returns)
                 std_slow = np.std(self.log_returns)
                 ratio = std_fast / max(std_slow, 1e-8)
-                if ratio > 2.0:
+                if ratio > high_vol_ratio:
                     vol_level = "HIGH"
-                elif ratio > 1.2:
+                elif ratio > medium_vol_ratio:
                     vol_level = "MEDIUM"
                 else:
                     vol_level = "LOW"
@@ -401,9 +552,9 @@ class PocketTracker:
             dt = self.tick_timestamps[-1] - self.tick_timestamps[0]
             if dt > 0:
                 freq = ((len(self.tick_timestamps) - 1) / dt) * 60.0
-            if freq >= 40.0:
+            if freq >= high_liq_freq:
                 liq_level = "HIGH"
-            elif freq >= 15.0:
+            elif freq >= medium_liq_freq:
                 liq_level = "MEDIUM"
             else:
                 liq_level = "LOW"
@@ -411,6 +562,8 @@ class PocketTracker:
         manip_flags = self.manip_detector.update(timestamp, price)
         push_snap = manip_flags.get("push_snap", 0.0)
         pinning = manip_flags.get("pinning", 0.0)
+        self.last_push_snap = push_snap
+        self.last_pinning = pinning
         
         manip_level = "LOW"
         if push_snap >= 0.7 or pinning >= 0.7:
@@ -542,7 +695,13 @@ class GateContext:
         four_hour_offset: int,
         volatility_score: float,
         payout_pct: float,
-        expiry_seconds: int = 0
+        expiry_seconds: int = 0,
+        oteo_score: float = 0.0,
+        z_score: float = 0.0,
+        regime_label: str | None = None,
+        regime_stable: bool = False,
+        manip_push_snap: float = 0.0,
+        manip_pinning: float = 0.0
     ) -> None:
         self.timestamp = timestamp
         self.price = price
@@ -560,6 +719,12 @@ class GateContext:
         self.volatility_score = volatility_score
         self.payout_pct = payout_pct
         self.expiry_seconds = expiry_seconds
+        self.oteo_score = oteo_score
+        self.z_score = z_score
+        self.regime_label = regime_label
+        self.regime_stable = regime_stable
+        self.manip_push_snap = manip_push_snap
+        self.manip_pinning = manip_pinning
 
 class FilterGate(Protocol):
     enabled: bool
@@ -574,10 +739,13 @@ class HurstFilterGate:
     def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
         if not self.enabled:
             return False, None
-        if context.hurst_regime == "trending":
-            return True, "hurst_veto_trend"
-        elif context.hurst_regime == "random_walk":
-            return True, "hurst_veto_chop"
+        # L1 numeric threshold (matches Auto Ghost hurst_filter_threshold)
+        if self.config.filter_threshold is not None:
+            if context.hurst_value >= self.config.filter_threshold:
+                return True, "hurst_veto_threshold"
+        # Regime whitelist — veto if current regime not in allowed list
+        if context.hurst_regime not in self.config.allowed_regimes:
+            return True, f"hurst_veto_{context.hurst_regime}"
         return False, None
 
 class OUFilterGate:
@@ -621,6 +789,58 @@ class TimeframeFilterGate:
             return True, f"timeframe_veto_block_{context.four_hour_offset}"
         return False, None
 
+class OTEOSignalGate:
+    def __init__(self, config: OTEOGateConfig) -> None:
+        self.config = config
+        self.enabled = any([
+            config.min_zscore_enabled,
+            config.max_zscore_enabled,
+            config.min_score_enabled,
+            config.max_score_enabled
+        ])
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+        
+        # Check Z-Score bounds
+        if self.config.min_zscore_enabled:
+            if abs(context.z_score) < self.config.min_zscore:
+                return True, f"oteo_veto_min_zscore_{abs(context.z_score):.2f}"
+        if self.config.max_zscore_enabled:
+            if abs(context.z_score) > self.config.max_zscore:
+                return True, f"oteo_veto_max_zscore_{abs(context.z_score):.2f}"
+                
+        # Check Score bounds
+        if self.config.min_score_enabled:
+            if context.oteo_score < self.config.min_score:
+                return True, f"oteo_veto_min_score_{context.oteo_score:.1f}"
+        if self.config.max_score_enabled:
+            if context.oteo_score > self.config.max_score:
+                return True, f"oteo_veto_max_score_{context.oteo_score:.1f}"
+                
+        return False, None
+
+class RegimeGate:
+    def __init__(self, config: RegimeGateConfig) -> None:
+        self.config = config
+        self.enabled = config.enabled
+
+    def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
+        if not self.enabled:
+            return False, None
+            
+        # Check stability constraint if required
+        if self.config.require_stable and not context.regime_stable:
+            return True, "regime_veto_unstable"
+            
+        # Whitelist check
+        if self.config.allowed_regimes:
+            if context.regime_label not in self.config.allowed_regimes:
+                return True, f"regime_veto_{context.regime_label}"
+                
+        return False, None
+
 class ManipulationFilterGate:
     def __init__(self, config: ManipulationConfig) -> None:
         self.config = config
@@ -629,11 +849,10 @@ class ManipulationFilterGate:
     def evaluate(self, context: GateContext) -> Tuple[bool, str | None]:
         if not self.enabled:
             return False, None
-        severity_mapping = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
-        current_val = severity_mapping.get(context.manip_level, 0)
-        limit_val = severity_mapping.get(self.config.min_severity_level, 3)
-        if current_val >= limit_val:
-            return True, f"manipulation_veto_{context.manip_level}"
+        # Veto if raw severity >= threshold
+        raw_sev = max(context.manip_push_snap, context.manip_pinning)
+        if raw_sev >= self.config.severity_threshold:
+            return True, f"manipulation_veto_{raw_sev:.2f}"
         return False, None
 
 class PocketPerCellGate:
@@ -687,7 +906,17 @@ class BayesianPerCellGate:
 class UnifiedBacktester:
     def __init__(self, config: UnifiedBacktestConfig) -> None:
         self.config = config
-        self.oteo = OTEO()
+        oteo_cfg = OTEOConfig(
+            min_abs_z_score=config.oteo_params.min_abs_z_score,
+            min_pressure_pct=config.oteo_params.min_pressure_pct,
+            score_center=config.oteo_params.score_center,
+            score_slope=config.oteo_params.score_slope,
+            cooldown_ticks=config.oteo_params.cooldown_ticks,
+            buffer_size=config.oteo_params.buffer_size,
+            pressure_window=config.oteo_params.pressure_window,
+            macro_window=config.oteo_params.macro_window
+        )
+        self.oteo = OTEO(config=oteo_cfg)
         self.context = MarketContextEngine()
         self.regime_classifier = RegimeClassifier()
         self.pocket_tracker = PocketTracker()
@@ -697,7 +926,8 @@ class UnifiedBacktester:
         self.hurst_tracker = UnifiedHurstTracker(
             window_size=config.hurst.window_size,
             mean_revert_limit=config.hurst.mean_revert_limit,
-            trend_limit=config.hurst.trend_limit
+            trend_limit=config.hurst.trend_limit,
+            min_scale_cutoff=config.hurst.min_scale_cutoff
         )
         self.ou_kalman_tracker = ParameterKalmanTracker(config.ou.q_beta, config.ou.r)
         
@@ -711,6 +941,8 @@ class UnifiedBacktester:
         self.pre_signal_gates = [
             HurstFilterGate(config.hurst),
             OUFilterGate(config.ou),
+            OTEOSignalGate(config.oteo_gate),
+            RegimeGate(config.regime),
             PocketPreSignalGate(config.pocket),
             TimeframeFilterGate(config.timeframe),
             ManipulationFilterGate(config.manipulation),
@@ -737,9 +969,22 @@ class UnifiedBacktester:
         self.hurst_tracker = UnifiedHurstTracker(
             window_size=self.config.hurst.window_size,
             mean_revert_limit=self.config.hurst.mean_revert_limit,
-            trend_limit=self.config.hurst.trend_limit
+            trend_limit=self.config.hurst.trend_limit,
+            min_scale_cutoff=self.config.hurst.min_scale_cutoff
         )
         self.ou_kalman_tracker = ParameterKalmanTracker(self.config.ou.q_beta, self.config.ou.r)
+        # Reset OTEO
+        oteo_cfg = OTEOConfig(
+            min_abs_z_score=self.config.oteo_params.min_abs_z_score,
+            min_pressure_pct=self.config.oteo_params.min_pressure_pct,
+            score_center=self.config.oteo_params.score_center,
+            score_slope=self.config.oteo_params.score_slope,
+            cooldown_ticks=self.config.oteo_params.cooldown_ticks,
+            buffer_size=self.config.oteo_params.buffer_size,
+            pressure_window=self.config.oteo_params.pressure_window,
+            macro_window=self.config.oteo_params.macro_window
+        )
+        self.oteo = OTEO(config=oteo_cfg)
         self.pending_trades.clear()
         self._price_buffer.clear()
         self._ou_last_price = None
@@ -753,6 +998,8 @@ class UnifiedBacktester:
             return []
         
         asset = ticks[0].asset
+        if asset in self.config.pocket.blacklist_assets:
+            return []
         date = path.stem
         
         rows: list[dict[str, Any]] = []
@@ -842,8 +1089,26 @@ class UnifiedBacktester:
                 self._ou_last_price = (raw_price, tick.timestamp)
 
             # Spike Pocket Classification
-            vol_lvl, liq_lvl, manip_lvl, pocket_state = self.pocket_tracker.update(tick.timestamp, raw_price)
+            vol_lvl, liq_lvl, manip_lvl, pocket_state = self.pocket_tracker.update(
+                tick.timestamp, raw_price, self.config.volatility, self.config.liquidity
+            )
             hour_offset, four_hour_offset = calculate_time_offsets(tick.timestamp)
+
+            # Extract OTEO and regime details for GateContext
+            oteo_score = 50.0
+            z_score = 0.0
+            if isinstance(oteo_res, dict):
+                oteo_score = float(oteo_res.get("oteo_score", 50.0))
+                z_score = float(oteo_res.get("z_score", 0.0))
+
+            regime_label = "INSUFFICIENT_DATA"
+            regime_stable = False
+            if last_regime is not None:
+                regime_label = last_regime.get("regime_label", "INSUFFICIENT_DATA")
+                regime_stable = bool(last_regime.get("regime_stable", False))
+
+            manip_push_snap = self.pocket_tracker.last_push_snap
+            manip_pinning = self.pocket_tracker.last_pinning
 
             # Create GateContext (with direction/expiry to be filled)
             gate_context = GateContext(
@@ -862,7 +1127,13 @@ class UnifiedBacktester:
                 four_hour_offset=four_hour_offset,
                 volatility_score=v_score,
                 payout_pct=self.config.payout_pct,
-                expiry_seconds=0
+                expiry_seconds=0,
+                oteo_score=oteo_score,
+                z_score=z_score,
+                regime_label=regime_label,
+                regime_stable=regime_stable,
+                manip_push_snap=manip_push_snap,
+                manip_pinning=manip_pinning
             )
 
             # 3. Evaluate Policies and Signals
