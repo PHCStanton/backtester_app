@@ -185,8 +185,23 @@ def run_optuna_study(
     objective = objective_factory(dates, asset, target_metric, min_trades, payout_pct)
     study.optimize(objective, n_trials=n_trials)
     
+    # Format float parameters to 2 decimal places (preserving scientific notation for very small noise parameters)
+    formatted_params = {}
+    for k, v in study.best_params.items():
+        if isinstance(v, float):
+            if abs(v) >= 0.01:
+                formatted_params[k] = round(v, 2)
+            else:
+                formatted_params[k] = float(f"{v:.2e}")
+        else:
+            formatted_params[k] = v
+
+    best_val = study.best_value
+    if best_val is not None:
+        best_val = round(best_val, 2)
+
     return {
-        "best_value": study.best_value,
-        "best_params": study.best_params,
+        "best_value": best_val,
+        "best_params": formatted_params,
         "total_trials": len(study.trials)
     }
